@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 import pandas
 import math
 import joblib
+import os
 
 seed = 666
 torch.manual_seed(seed)
@@ -23,10 +24,12 @@ BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 GENERATE_EVERY  = 100
 NUM_TOKENS = 28996 + 2
+# NUM_TOKENS = 30000
 ENC_SEQ_LEN = 512
 DEC_SEQ_LEN = 256 + 1
-EPOCHS = 10
-
+STEP_SIZE = 200000
+START_STEP = 0
+MODEL_PATH = './models'
 
 print("Creating Dataset")
 ## create dataset
@@ -100,71 +103,85 @@ model = model.cuda()
 print("Setting Optimizer")
 ## optimizer
 
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+optim = torch.optim.Adam(model.parameters(), lr = LEARNING_RATE)
 scaler = GradScaler()
 
 
+if any(os.scandir(MODEL_PATH)):
+
+    #directory = "/home/ayan/data/python_files/my_summ_data/datasets/train"
+    model_path = os.path.abspath(MODEL_PATH)
+    model_list = [entry.path for entry in os.scandir(model_path) if entry.is_file()]
+    iteration_completed_indices = []
+
+    for file_index in range(len(model_list)):
+        iteration_completed_indices.append(int(model_list[file_index].split('_--_')[1]))
+
+    iteration_completed_indices.sort()
+    final_model_path = os.path.join(MODEL_PATH, 'iter_--_', str(iteration_completed_indices[-1]), '_--_checkpoints.pt')
+    print(iteration_completed_indices)
+    print(final_model_path)
+    model.load_state_dict(final_model_path['model_state_dict'])
+    optim.load_state_dict(final_model_path['optimizer_state_dict'])
+
+    
 print("Starting Training")
 ## training model
 
-rng = math.ceil(287083/BATCH_SIZE)
+for iteration in tqdm.tqdm(range(START_STEP, STEP_SIZE), mininterval = 10., desc = 'training'):
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.train()
+    
+    src, src_mask, tgt, tgt_mask, indices = next(iter(summary_dataloader))
+    src_mask = src_mask.cuda()
+    src = src.long().cuda()
+    tgt_mask = tgt_mask.cuda()
+    tgt = tgt.long().cuda()
+    
+    with autocast():
+        loss = model(src, tgt, enc_mask = src_mask, dec_mask = tgt_mask)
+    
+    # print(src.shape, src_mask.shape, tgt.shape, tgt_mask.shape)
+    # print("\n\n")
+    # print(indices)
+    # print(loss)
+    # scaler.scale(loss).backward()
+    scaler.scale(loss).sum().backward()
+    
+    # print(f'{i}: {loss.item()}')
+    print(f'{iteration}: {loss.sum()}')
 
-for EPOCH in EPOCHS:
+    scaler.step(optim)
+    scaler.update()
+    optim.zero_grad()
 
-    for iteration in tqdm.tqdm(range(rng), mininterval = 10., desc = 'training'):
+    if iteration%10 == 0:
+
+        path = os.path.join(MODEL_PATH, 'iter_--_' + str(iteration) + '_--_checkpoints.pt')
+        torch.save({
+            'iteration' : iteration,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optim.state_dict(),
+            'loss': loss,
+            }, path)
+
+    if iteration != 0 and iteration % GENERATE_EVERY == 0:
         
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-        model.train()
-        
-        src, src_mask, tgt, tgt_mask, indices = next(iter(summary_dataloader))
+        model.eval()
+        src, src_mask, _, _, _ = next(iter(summary_dataloader))
+
+        src, src_mask = src[:1], src_mask[:1]
+        start_tokens = (torch.ones((1, 1)) * 1).long().cuda()
+
+        src = src.cuda()
         src_mask = src_mask.cuda()
-        src = src.long().cuda()
-        tgt_mask = tgt_mask.cuda()
-        tgt = tgt.long().cuda()
-        
-        with autocast():
-            loss = model(src, tgt, enc_mask = src_mask, dec_mask = tgt_mask)
-        
-        # print(src.shape, src_mask.shape, tgt.shape, tgt_mask.shape)
-        print("\n\n")
-        print(indices)
-        print(loss)
-        # scaler.scale(loss).backward()
-        scaler.scale(loss).sum().backward()
-        
-        # print(f'{i}: {loss.item()}')
-        print(f'{iteration}: {loss.sum()}')
 
-        scaler.step(optim)
-        scaler.update()
-        optim.zero_grad()
+        sample = model.generate(src, start_tokens, ENC_SEQ_LEN, enc_mask = src_mask)
+        # sample = model.module.generate(src, start_tokens, ENC_SEQ_LEN, enc_mask = src_mask)
+        incorrects = (src != sample).abs().sum()
 
-        if iteration%20 == 0:
-
-            path = 'models/epoch_' + str(EPOCH) + "_iter_" + str(iteration) + '.pt'
-            torch.save({
-                'epoch': EPOCH,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optim.state_dict(),
-                'loss': loss,
-                }, path)
-
-        if iteration != 0 and iteration % GENERATE_EVERY == 0:
-            
-            model.eval()
-            src, src_mask, _, _, _ = next(iter(summary_dataloader))
-
-            src, src_mask = src[:1], src_mask[:1]
-            start_tokens = (torch.ones((1, 1)) * 1).long().cuda()
-
-            src = src.cuda()
-            src_mask = src_mask.cuda()
-
-            sample = model.generate(src, start_tokens, ENC_SEQ_LEN, enc_mask = src_mask)
-            # sample = model.module.generate(src, start_tokens, ENC_SEQ_LEN, enc_mask = src_mask)
-            incorrects = (src != sample).abs().sum()
-
-            print(f"input:  ", src)
-            print(f"predicted output:  ", sample)
-            print(f"incorrects: {incorrects}")
+        print(f"input:  ", src)
+        print(f"predicted output:  ", sample)
+        print(f"incorrects: {incorrects}")

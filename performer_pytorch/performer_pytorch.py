@@ -650,6 +650,7 @@ class PerformerLM(nn.Module):
 
         # token and positional embeddings
         x = self.token_emb(x)
+
         x += self.pos_emb(x)
 
         x = self.dropout(x)
